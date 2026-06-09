@@ -101,3 +101,38 @@ def test_get_latest_reading_not_found():
     response = client.get("/readings/nonexistent/latest")
     assert response.status_code == 404
     assert response.json()["detail"] == "Device not found"
+
+
+def test_create_bulk_readings():
+    payload = {
+        "readings": [
+            {"device_id": "dev-1", "sensor_type": "temp", "value": 22.0, "unit": "C"},
+            {"device_id": "dev-2", "sensor_type": "humidity", "value": 60.0, "unit": "%"},
+            {"device_id": "dev-3", "sensor_type": "pressure", "value": 1013.0, "unit": "hPa"},
+        ]
+    }
+    response = client.post("/readings/bulk", json=payload)
+    assert response.status_code == 207
+    data = response.json()
+    assert data["total_received"] == 3
+    assert data["total_saved"] == 3
+    assert data["errors"] == []
+
+
+def test_create_bulk_empty_readings():
+    response = client.post("/readings/bulk", json={"readings": []})
+    assert response.status_code == 422
+
+
+def test_create_bulk_single_reading():
+    payload = {
+        "readings": [
+            {"device_id": "solo", "sensor_type": "light", "value": 400.0, "unit": "lux"},
+        ]
+    }
+    response = client.post("/readings/bulk", json=payload)
+    assert response.status_code == 207
+    data = response.json()
+    assert data["total_received"] == 1
+    assert data["total_saved"] == 1
+    assert data["errors"] == []

@@ -10,7 +10,12 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="TelemetryAPI", lifespan=lifespan)
+app = FastAPI(
+    title="Device Telemetry API",
+    version="1.0.0",
+    description="REST API for ingesting and querying device sensor readings.",
+    lifespan=lifespan,
+)
 
 app.include_router(telemetry.router)
 
