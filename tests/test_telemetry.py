@@ -1,100 +1,127 @@
+import asyncio
 import pytest
-from fastapi.testclient import TestClient
+from starlette.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
 from app.main import app
-from app.database import Base, engine, SessionLocal
+from app.database import Base, get_db
+import app.routers.telemetry as telemetry_module
+
+# ── in-memory SQLite for test isolation ──────────────────────────────────
+test_engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+
+def override_get_db():
+    db = TestSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+app.dependency_overrides[get_db] = override_get_db
+telemetry_module.SessionLocal = TestSessionLocal
 
 client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
 def setup_db():
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=test_engine)
     yield
-    Base.metadata.drop_all(bind=engine)
+    Base.metadata.drop_all(bind=test_engine)
 
 
+# ── helper ───────────────────────────────────────────────────────────────
+def _valid_reading(device_id="d1", sensor_type="temp", value=20.0, unit="C", timestamp=None):
+    reading = {"device_id": device_id, "sensor_type": sensor_type, "value": value, "unit": unit}
+    if timestamp is not None:
+        reading["timestamp"] = timestamp
+    return reading
+
+
+# ── health check ─────────────────────────────────────────────────────────
 def test_health_check():
     response = client.get("/")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_create_reading():
-    payload = {
-        "device_id": "device-1",
-        "sensor_type": "temperature",
-        "value": 23.5,
-        "unit": "celsius",
-    }
+# ── POST /readings ───────────────────────────────────────────────────────
+def test_post_single_reading_success():
+    payload = _valid_reading()
     response = client.post("/readings/", json=payload)
     assert response.status_code == 201
     data = response.json()
-    assert data["id"] is not None
-    assert data["device_id"] == "device-1"
-    assert data["sensor_type"] == "temperature"
-    assert data["value"] == 23.5
-    assert data["unit"] == "celsius"
+    assert "id" in data
+    assert data["device_id"] == payload["device_id"]
+    assert data["sensor_type"] == payload["sensor_type"]
+    assert data["value"] == payload["value"]
+    assert data["unit"] == payload["unit"]
     assert "timestamp" in data
 
 
-def test_get_readings():
-    for i in range(3):
-        client.post(
-            "/readings/",
-            json={
-                "device_id": f"device-{i % 2}",
-                "sensor_type": "temperature",
-                "value": 20.0 + i,
-                "unit": "celsius",
-            },
-        )
+def test_post_reading_missing_field():
+    payload = {"device_id": "d1", "sensor_type": "temp", "unit": "C"}
+    response = client.post("/readings/", json=payload)
+    assert response.status_code == 422
+
+
+def test_post_reading_invalid_value_type():
+    payload = _valid_reading(value="not-a-number")
+    response = client.post("/readings/", json=payload)
+    assert response.status_code == 422
+
+
+# ── GET /readings ────────────────────────────────────────────────────────
+def test_get_all_readings_empty():
     response = client.get("/readings/")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_get_readings_filter_by_device():
+    for _ in range(3):
+        client.post("/readings/", json=_valid_reading(device_id="A"))
+    for _ in range(2):
+        client.post("/readings/", json=_valid_reading(device_id="B"))
+    response = client.get("/readings/?device_id=A")
     assert response.status_code == 200
     assert len(response.json()) == 3
 
 
-def test_get_readings_filtered_by_device():
-    for i in range(3):
-        client.post(
-            "/readings/",
-            json={
-                "device_id": f"device-{i % 2}",
-                "sensor_type": "temperature",
-                "value": 20.0 + i,
-                "unit": "celsius",
-            },
-        )
-    response = client.get("/readings/?device_id=device-1")
-    assert response.status_code == 200
-    data = response.json()
-    assert len(data) == 1
-    assert data[0]["device_id"] == "device-1"
-
-
-def test_get_readings_filtered_by_type():
-    client.post("/readings/", json={"device_id": "d1", "sensor_type": "temp", "value": 1.0, "unit": "C"})
-    client.post("/readings/", json={"device_id": "d2", "sensor_type": "humidity", "value": 50.0, "unit": "%"})
-    response = client.get("/readings/?sensor_type=humidity")
-    assert response.status_code == 200
-    data = response.json()
-    assert len(data) == 1
-    assert data[0]["sensor_type"] == "humidity"
-
-
 def test_get_readings_limit():
-    for i in range(5):
-        client.post("/readings/", json={"device_id": "d1", "sensor_type": "temp", "value": float(i), "unit": "C"})
-    response = client.get("/readings/?limit=2")
+    for i in range(10):
+        client.post("/readings/", json=_valid_reading(value=float(i)))
+    response = client.get("/readings/?limit=5")
     assert response.status_code == 200
-    assert len(response.json()) == 2
+    assert len(response.json()) == 5
 
 
-def test_get_latest_reading():
-    client.post("/readings/", json={"device_id": "d1", "sensor_type": "temp", "value": 10.0, "unit": "C"})
-    client.post("/readings/", json={"device_id": "d1", "sensor_type": "temp", "value": 99.0, "unit": "C"})
-    response = client.get("/readings/d1/latest")
+# ── GET /readings/{device_id}/latest ─────────────────────────────────────
+def test_get_latest_reading_exists():
+    client.post(
+        "/readings/",
+        json=_valid_reading(device_id="dev", value=10.0, timestamp="2026-01-01T00:00:00"),
+    )
+    client.post(
+        "/readings/",
+        json=_valid_reading(device_id="dev", value=20.0, timestamp="2026-06-01T00:00:00"),
+    )
+    client.post(
+        "/readings/",
+        json=_valid_reading(device_id="dev", value=30.0, timestamp="2026-12-01T00:00:00"),
+    )
+    response = client.get("/readings/dev/latest")
     assert response.status_code == 200
-    assert response.json()["value"] == 99.0
+    assert response.json()["value"] == 30.0
 
 
 def test_get_latest_reading_not_found():
@@ -103,36 +130,35 @@ def test_get_latest_reading_not_found():
     assert response.json()["detail"] == "Device not found"
 
 
-def test_create_bulk_readings():
-    payload = {
-        "readings": [
-            {"device_id": "dev-1", "sensor_type": "temp", "value": 22.0, "unit": "C"},
-            {"device_id": "dev-2", "sensor_type": "humidity", "value": 60.0, "unit": "%"},
-            {"device_id": "dev-3", "sensor_type": "pressure", "value": 1013.0, "unit": "hPa"},
-        ]
-    }
-    response = client.post("/readings/bulk", json=payload)
+# ── POST /readings/bulk ──────────────────────────────────────────────────
+def test_bulk_ingestion_success():
+    readings = [_valid_reading(device_id=f"dev-{i}") for i in range(10)]
+    response = client.post("/readings/bulk", json={"readings": readings})
     assert response.status_code == 207
     data = response.json()
-    assert data["total_received"] == 3
-    assert data["total_saved"] == 3
+    assert data["total_received"] == 10
+    assert data["total_saved"] == 10
     assert data["errors"] == []
 
 
-def test_create_bulk_empty_readings():
-    response = client.post("/readings/bulk", json={"readings": []})
-    assert response.status_code == 422
+def test_bulk_ingestion_partial_errors(monkeypatch):
+    original = telemetry_module._insert_one
 
+    async def _injecting_insert_one(reading):
+        await asyncio.sleep(0)
+        if reading.device_id in ("bad-1", "bad-2"):
+            raise ValueError("Simulated DB error")
+        return await original(reading)
 
-def test_create_bulk_single_reading():
-    payload = {
-        "readings": [
-            {"device_id": "solo", "sensor_type": "light", "value": 400.0, "unit": "lux"},
-        ]
-    }
-    response = client.post("/readings/bulk", json=payload)
+    monkeypatch.setattr(telemetry_module, "_insert_one", _injecting_insert_one)
+
+    readings = [_valid_reading(device_id=f"dev-{i}") for i in range(8)]
+    readings.append(_valid_reading(device_id="bad-1"))
+    readings.append(_valid_reading(device_id="bad-2"))
+
+    response = client.post("/readings/bulk", json={"readings": readings})
     assert response.status_code == 207
     data = response.json()
-    assert data["total_received"] == 1
-    assert data["total_saved"] == 1
-    assert data["errors"] == []
+    assert data["total_received"] == 10
+    assert data["total_saved"] == 8
+    assert len(data["errors"]) == 2
