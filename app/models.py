@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SensorReading(BaseModel):
@@ -7,4 +7,4 @@ class SensorReading(BaseModel):
     sensor_type: str
     value: float
     unit: str
-    timestamp: datetime = datetime.now()
+    timestamp: datetime = Field(default_factory=datetime.now)

@@ -21,7 +21,8 @@ class SensorReadingORM(Base):
     timestamp = Column(DateTime, default=datetime.now)
 
 
-Base.metadata.create_all(bind=engine)
+def create_tables():
+    Base.metadata.create_all(bind=engine)
 
 
 def get_db():
