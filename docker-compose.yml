@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=production
+    volumes:
+      - telemetry_data:/app/telemetry.db
+
+volumes:
+  telemetry_data:
